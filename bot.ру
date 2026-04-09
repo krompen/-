@@ -1,0 +1,364 @@
+import io
+import sqlite3
+import datetime
+import random
+from telegram import Update, InputFile
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, InlineKeyboardButton, InlineKeyboardMarkup
+
+# ========== КОНФИГ ==========
+TOKEN = "8740232732:AAF9feDsXhpBdVvEVS9Nkr37W4zQGvfHPc0"
+DB_NAME = "tts_bot.db"
+
+# ========== НАСТРОЙКИ ГОЛОСОВ ==========
+# Для gTTS меняем только язык и скорость (slow=False/True)
+# Для разных эффектов используем разные языки и параметры
+VOICES = {
+    "old_man": {
+        "name": "👴 МУДРЫЙ ДЕД",
+        "lang": "ru",
+        "slow": True,
+        "description": "Старый, хрипловатый, философский голос"
+    },
+    "old_woman": {
+        "name": "👵 ЗАБОТЛИВАЯ БАБКА", 
+        "lang": "ru",
+        "slow": True,
+        "description": "Мягкий, тёплый, добрый голос"
+    },
+    "young_man": {
+        "name": "🧑 МОЛОДОЙ ПАРЕНЬ",
+        "lang": "ru",
+        "slow": False,
+        "description": "Бодрый, современный голос"
+    },
+    "young_woman": {
+        "name": "👩 ДЕВУШКА",
+        "lang": "ru",
+        "slow": False,
+        "description": "Приятный, женский голос"
+    },
+    "robot": {
+        "name": "🤖 РОБОТ",
+        "lang": "ru",
+        "slow": True,
+        "description": "Механический, как из фильмов"
+    },
+    "british": {
+        "name": "🇬🇧 БРИТАНЕЦ (EN)",
+        "lang": "en",
+        "slow": False,
+        "description": "Английский акцент (текст на английском)"
+    }
+}
+
+# ========== ПРОВЕРКА gTTS ==========
+try:
+    from gtts import gTTS
+    TTS_AVAILABLE = True
+except ImportError:
+    TTS_AVAILABLE = False
+
+# ========== БАЗА ДАННЫХ ==========
+def init_db():
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        voice TEXT DEFAULT 'old_man',
+        registered_at TEXT
+    )''')
+    c.execute('''CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        text TEXT,
+        voice TEXT,
+        created_at TEXT
+    )''')
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ========== ФУНКЦИИ БД ==========
+def get_user_voice(user_id):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('SELECT voice FROM users WHERE user_id = ?', (user_id,))
+    row = c.fetchone()
+    if not row:
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute('INSERT INTO users (user_id, voice, registered_at) VALUES (?, ?, ?)', (user_id, "old_man", now))
+        conn.commit()
+        conn.close()
+        return "old_man"
+    conn.close()
+    return row[0]
+
+def set_user_voice(user_id, voice):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    c.execute('UPDATE users SET voice = ? WHERE user_id = ?', (voice, user_id))
+    conn.commit()
+    conn.close()
+
+def save_history(user_id, text, voice):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute('INSERT INTO history (user_id, text, voice, created_at) VALUES (?, ?, ?, ?)',
+              (user_id, text[:500], voice, now))
+    conn.commit()
+    conn.close()
+
+def get_history(user_id, limit=10):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    history = c.execute('SELECT id, text, voice, created_at FROM history WHERE user_id = ? ORDER BY id DESC LIMIT ?', (user_id, limit)).fetchall()
+    conn.close()
+    return history
+
+def delete_history(user_id, history_id=None):
+    conn = sqlite3.connect(DB_NAME, timeout=10)
+    c = conn.cursor()
+    if history_id:
+        c.execute('DELETE FROM history WHERE id = ? AND user_id = ?', (history_id, user_id))
+    else:
+        c.execute('DELETE FROM history WHERE user_id = ?', (user_id,))
+    conn.commit()
+    conn.close()
+
+# ========== КЛАВИАТУРЫ ==========
+def main_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎙️ ВЫБРАТЬ ГОЛОС", callback_data="choose_voice")],
+        [InlineKeyboardButton("📋 ИСТОРИЯ", callback_data="history"),
+         InlineKeyboardButton("🗑️ ОЧИСТИТЬ", callback_data="clear_history")],
+        [InlineKeyboardButton("ℹ️ ИНФО", callback_data="info")]
+    ])
+
+def voices_keyboard():
+    keyboard = []
+    for voice_id, voice in VOICES.items():
+        keyboard.append([InlineKeyboardButton(f"{voice['name']}", callback_data=f"voice_{voice_id}")])
+    keyboard.append([InlineKeyboardButton("🔙 НАЗАД", callback_data="back")])
+    return InlineKeyboardMarkup(keyboard)
+
+def back_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 НАЗАД", callback_data="back")]])
+
+# ========== TTS ФУНКЦИЯ ==========
+async def text_to_voice(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, voice_id: str):
+    if not TTS_AVAILABLE:
+        return "❌ ОШИБКА: gTTS НЕ УСТАНОВЛЕН! Установи: pip install gTTS"
+    
+    if len(text) > 500:
+        return "❌ ТЕКСТ СЛИШКОМ ДЛИННЫЙ! МАКСИМУМ 500 СИМВОЛОВ."
+    
+    if not text.strip():
+        return "❌ ТЕКСТ НЕ МОЖЕТ БЫТЬ ПУСТЫМ!"
+    
+    voice = VOICES.get(voice_id, VOICES["old_man"])
+    
+    try:
+        # Генерируем голосовое с выбранными параметрами
+        tts = gTTS(text=text, lang=voice["lang"], slow=voice["slow"])
+        audio_bytes = io.BytesIO()
+        tts.write_to_fp(audio_bytes)
+        audio_bytes.seek(0)
+        
+        # Отправляем
+        await update.message.reply_voice(voice=InputFile(audio_bytes, filename="voice.ogg"))
+        
+        # Сохраняем в историю
+        save_history(update.effective_user.id, text, voice_id)
+        
+        return f"✅ ГОЛОСОВОЕ ОТПРАВЛЕНО! (ГОЛОС: {voice['name']})"
+    except Exception as e:
+        return f"❌ ОШИБКА: {str(e)[:100]}"
+
+# ========== ОБРАБОТЧИКИ ==========
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    user_id = update.effective_user.id
+    current_voice = get_user_voice(user_id)
+    current_voice_name = VOICES.get(current_voice, VOICES["old_man"])["name"]
+    
+    await update.message.reply_text(
+        "╔════════════════════════════════════════════╗\n"
+        "║  🎤 TTS BOT — ТЕКСТ В ГОЛОС С ВЫБОРОМ    ║\n"
+        "╠════════════════════════════════════════════╣\n"
+        "║  📝 ПРОСТО ОТПРАВЬ ЛЮБОЙ ТЕКСТ            ║\n"
+        "║  🎧 БОТ ОЗВУЧИТ ЕГО ВЫБРАННЫМ ГОЛОСОМ     ║\n"
+        "║  🗣️ ДОСТУПНО 6 РАЗНЫХ ГОЛОСОВ             ║\n"
+        "║  👴 В ТОМ ЧИСЛЕ МУДРЫЙ ДЕД И БАБКА        ║\n"
+        "╠════════════════════════════════════════════╣\n"
+        f"║  🎙️ ТЕКУЩИЙ ГОЛОС: {current_voice_name}     ║\n"
+        "║  ⚠️ МАКСИМУМ: 500 СИМВОЛОВ               ║\n"
+        "╚════════════════════════════════════════════╝\n\n"
+        "⬇️ **ВЫБЕРИ ДЕЙСТВИЕ ИЛИ ПИШИ ТЕКСТ:**",
+        reply_markup=main_keyboard(),
+        parse_mode="Markdown"
+    )
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    data = query.data
+    await query.answer()
+    user_id = query.from_user.id
+    
+    if data == "back":
+        current_voice = get_user_voice(user_id)
+        current_voice_name = VOICES.get(current_voice, VOICES["old_man"])["name"]
+        await query.edit_message_text(
+            f"╔════════════════════════════════════════════╗\n"
+            f"║  🎤 TTS BOT — ТЕКСТ В ГОЛОС С ВЫБОРОМ    ║\n"
+            f"╠════════════════════════════════════════════╣\n"
+            f"║  🎙️ ТЕКУЩИЙ ГОЛОС: {current_voice_name}     ║\n"
+            f"╚════════════════════════════════════════════╝\n\n"
+            f"⬇️ **ВЫБЕРИ ДЕЙСТВИЕ ИЛИ ПИШИ ТЕКСТ:**",
+            reply_markup=main_keyboard(),
+            parse_mode="Markdown"
+        )
+    
+    elif data == "choose_voice":
+        text = "🎙️ **ВЫБЕРИ ГОЛОС:**\n\n"
+        for voice_id, voice in VOICES.items():
+            text += f"• {voice['name']}: {voice['description']}\n"
+        await query.edit_message_text(text, reply_markup=voices_keyboard(), parse_mode="Markdown")
+    
+    elif data.startswith("voice_"):
+        voice_id = data.replace("voice_", "")
+        set_user_voice(user_id, voice_id)
+        voice_name = VOICES[voice_id]["name"]
+        
+        # Пример фразы для теста
+        test_phrases = {
+            "old_man": "Эх, молодёжь... В моё время трава была зеленее, а пароли надёжнее...",
+            "old_woman": "Ох, внучек, будь осторожнее в интернете...",
+            "young_man": "Йоу, бро! Это тестовое сообщение!",
+            "young_woman": "Привет! Как дела? Это тест голоса.",
+            "robot": "ПРИВЕТСТВУЮ. ЭТО ТЕСТОВОЕ СООБЩЕНИЕ. РАБОТАЮ.",
+            "british": "Hello! This is a test message from your British assistant."
+        }
+        test_text = test_phrases.get(voice_id, "Тестовое сообщение")
+        
+        await query.edit_message_text(
+            f"✅ **ГОЛОС ИЗМЕНЁН: {voice_name}**\n\n"
+            f"🎧 **ТЕСТОВАЯ ФРАЗА:**\n"
+            f"_{test_text}_\n\n"
+            f"⬇️ ТЕПЕРЬ ПРОСТО ОТПРАВЬ ЛЮБОЙ ТЕКСТ!",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+        
+        # Отправляем тестовое голосовое
+        try:
+            voice = VOICES[voice_id]
+            tts = gTTS(text=test_text, lang=voice["lang"], slow=voice["slow"])
+            audio_bytes = io.BytesIO()
+            tts.write_to_fp(audio_bytes)
+            audio_bytes.seek(0)
+            await context.bot.send_voice(chat_id=user_id, voice=InputFile(audio_bytes, filename="test.ogg"))
+        except Exception as e:
+            await context.bot.send_message(chat_id=user_id, text=f"❌ Ошибка теста: {e}")
+    
+    elif data == "history":
+        history = get_history(user_id, 10)
+        if not history:
+            await query.edit_message_text(
+                "📭 **ИСТОРИЯ ПУСТА**\n\nПОСЛЕ ПЕРВОГО ИСПОЛЬЗОВАНИЯ ЗДЕСЬ ПОЯВЯТСЯ ЗАПРОСЫ.",
+                reply_markup=back_keyboard(),
+                parse_mode="Markdown"
+            )
+            return
+        
+        text = "📋 **ИСТОРИЯ ПОСЛЕДНИХ ЗАПРОСОВ:**\n\n"
+        for h in history[:10]:
+            voice_name = VOICES.get(h[2], VOICES["old_man"])["name"]
+            text += f"┌─────────────────────────────────┐\n"
+            text += f"│ #{h[0]} | {voice_name}\n"
+            text += f"│ 📝 {h[1][:50]}\n"
+            text += f"│ 📅 {h[3][:10]}\n"
+            text += f"└─────────────────────────────────┘\n\n"
+        
+        keyboard = []
+        for h in history[:5]:
+            keyboard.append([InlineKeyboardButton(f"🗑️ УДАЛИТЬ #{h[0]}", callback_data=f"del_{h[0]}")])
+        keyboard.append([InlineKeyboardButton("🗑️ ОЧИСТИТЬ ВСЁ", callback_data="clear_history")])
+        keyboard.append([InlineKeyboardButton("🔙 НАЗАД", callback_data="back")])
+        
+        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown")
+    
+    elif data.startswith("del_"):
+        history_id = int(data.split("_")[1])
+        delete_history(user_id, history_id)
+        await query.edit_message_text(
+            "✅ ЗАПРОС УДАЛЁН!",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ИСТОРИЯ", callback_data="history")]])
+        )
+    
+    elif data == "clear_history":
+        delete_history(user_id)
+        await query.edit_message_text(
+            "✅ ВСЯ ИСТОРИЯ ОЧИЩЕНА!",
+            reply_markup=back_keyboard()
+        )
+    
+    elif data == "info":
+        await query.edit_message_text(
+            "╔════════════════════════════════════════════╗\n"
+            "║  ℹ️ **ИНФОРМАЦИЯ О БОТЕ**                 ║\n"
+            "╠════════════════════════════════════════════╣\n"
+            "║  🤖 TTS BOT v3.0                          ║\n"
+            "║  🎤 ТЕКСТ → ГОЛОС С ВЫБОРОМ               ║\n"
+            "║  🗣️ 6 УНИКАЛЬНЫХ ГОЛОСОВ                 ║\n"
+            "║  👴 МУДРЫЙ ДЕД, БАБКА, РОБОТ И ДР.        ║\n"
+            "╠════════════════════════════════════════════╣\n"
+            "║  🔧 ТЕХНОЛОГИЯ: Google TTS                ║\n"
+            "║  💰 ПОЛНОСТЬЮ БЕСПЛАТНО                   ║\n"
+            "║  📋 ИСТОРИЯ ХРАНИТСЯ В БД                  ║\n"
+            "╚════════════════════════════════════════════╝\n\n"
+            "🎙️ **ДОСТУПНЫЕ ГОЛОСА:**\n"
+            "• 👴 МУДРЫЙ ДЕД — хрипловатый, философский\n"
+            "• 👵 ЗАБОТЛИВАЯ БАБКА — мягкий, добрый\n"
+            "• 🧑 МОЛОДОЙ ПАРЕНЬ — бодрый, современный\n"
+            "• 👩 ДЕВУШКА — приятный, женский\n"
+            "• 🤖 РОБОТ — механический\n"
+            "• 🇬🇧 БРИТАНЕЦ — английский акцент",
+            reply_markup=back_keyboard(),
+            parse_mode="Markdown"
+        )
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
+    
+    # Получаем выбранный голос
+    voice_id = get_user_voice(user_id)
+    
+    # Отправляем статус "печатает"
+    await context.bot.send_chat_action(chat_id=user_id, action="upload_voice")
+    
+    # Генерируем голосовое
+    result = await text_to_voice(update, context, text, voice_id)
+    
+    # Если есть сообщение об ошибке — отправляем
+    if result and result.startswith("❌"):
+        await update.message.reply_text(result, reply_markup=main_keyboard())
+
+def main():
+    if not TTS_AVAILABLE:
+        print("❌ УСТАНОВИТЕ gTTS: pip install gTTS")
+        return
+    
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    print("🚀 TTS БОТ С ВЫБОРОМ ГОЛОСА ЗАПУЩЕН!")
+    app.run_polling(drop_pending_updates=True)
+
+if __name__ == "__main__":
+    main()
